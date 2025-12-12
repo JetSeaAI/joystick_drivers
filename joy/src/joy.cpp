@@ -191,18 +191,17 @@ bool Joy::handleJoyAxis(const SDL_Event & e)
     RCLCPP_WARN(get_logger(), "Saw axes too large for this device, ignoring");
     return publish;
   }
-  std::string name(SDL_JoystickName(joystick_));
   int axis_index = e.jaxis.axis;
-  if (name.find("Xbox") != std::string::npos) {
+  if (joy_msg_.header.frame_id == "xbox" || joy_msg_.header.frame_id == "dualsense") {
     if (axis_index == 2) {
       axis_index = 4;  // Remap TRIGGERLEFT to PS5 TRIGGERLEFT
     } else if (axis_index == 4) {
       axis_index = 3;  // Remap RIGHT_X to PS5 RIGHT_X
     } else if (axis_index == 3){
       axis_index =2;   // Remap RIGHT_Y to PS5 RIGHT_Y
-
     }
   }
+
   float last_axis_value = joy_msg_.axes.at(axis_index);
   joy_msg_.axes.at(axis_index) = convertRawAxisValueToROS(e.jaxis.value);
   if (last_axis_value != joy_msg_.axes.at(axis_index)) {
@@ -236,11 +235,20 @@ bool Joy::handleJoyButtonDown(const SDL_Event & e)
     return publish;
   }
 
+  int button_index = e.jbutton.button;
+  if (joy_msg_.header.frame_id == "dualsense") {
+    if (button_index == 2) {
+      button_index = 3;  
+    } else if (button_index == 3){
+      button_index =2;   
+    }
+  }
+
   if (sticky_buttons_) {
     // For sticky buttons, invert 0 -> 1 or 1 -> 0
-    joy_msg_.buttons.at(e.jbutton.button) = 1 - joy_msg_.buttons.at(e.jbutton.button);
+    joy_msg_.buttons.at(button_index) = 1 - joy_msg_.buttons.at(button_index);
   } else {
-    joy_msg_.buttons.at(e.jbutton.button) = 1;
+    joy_msg_.buttons.at(button_index) = 1;
   }
   publish = true;
 
@@ -260,8 +268,17 @@ bool Joy::handleJoyButtonUp(const SDL_Event & e)
     return publish;
   }
 
+  int button_index = e.jbutton.button;
+  if (joy_msg_.header.frame_id == "dualsense") {
+    if (button_index == 2) {
+      button_index = 3;  
+    } else if (button_index == 3){
+      button_index =2;   
+    }
+  }
+  
   if (!sticky_buttons_) {
-    joy_msg_.buttons.at(e.jbutton.button) = 0;
+    joy_msg_.buttons.at(button_index) = 0;
     publish = true;
   }
 
@@ -419,9 +436,12 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
       joy_msg_.header.frame_id = "xbox";
 
     } else if(name.find("PS5") != std::string::npos){
-      RCLCPP_INFO(get_logger(), "This is PS5 controller, no axis remapping needed.");
+      RCLCPP_WARN(get_logger(), "This is PS5 controller, no axis remapping needed.");
       joy_msg_.header.frame_id = "ps5";
-    }
+    } else if(name.find("DualSense") != std::string::npos){
+      RCLCPP_WARN(get_logger(), "This is DualSense controller axis and buttons mapping version.");
+      joy_msg_.header.frame_id = "dualsense";
+    } 
 
 }
 
