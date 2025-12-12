@@ -191,10 +191,21 @@ bool Joy::handleJoyAxis(const SDL_Event & e)
     RCLCPP_WARN(get_logger(), "Saw axes too large for this device, ignoring");
     return publish;
   }
+  std::string name(SDL_JoystickName(joystick_));
+  int axis_index = e.jaxis.axis;
+  if (name.find("Xbox") != std::string::npos) {
+    if (axis_index == 2) {
+      axis_index = 4;  // Remap TRIGGERLEFT to PS5 TRIGGERLEFT
+    } else if (axis_index == 4) {
+      axis_index = 3;  // Remap RIGHT_X to PS5 RIGHT_X
+    } else if (axis_index == 3){
+      axis_index =2;   // Remap RIGHT_Y to PS5 RIGHT_Y
 
-  float last_axis_value = joy_msg_.axes.at(e.jaxis.axis);
-  joy_msg_.axes.at(e.jaxis.axis) = convertRawAxisValueToROS(e.jaxis.value);
-  if (last_axis_value != joy_msg_.axes.at(e.jaxis.axis)) {
+    }
+  }
+  float last_axis_value = joy_msg_.axes.at(axis_index);
+  joy_msg_.axes.at(axis_index) = convertRawAxisValueToROS(e.jaxis.value);
+  if (last_axis_value != joy_msg_.axes.at(axis_index)) {
     if (coalesce_interval_ms_ > 0 && !publish_soon_) {
       publish_soon_ = true;
       publish_soon_time_ = this->now();
@@ -210,6 +221,7 @@ bool Joy::handleJoyAxis(const SDL_Event & e)
 
   return publish;
 }
+
 
 bool Joy::handleJoyButtonDown(const SDL_Event & e)
 {
@@ -400,6 +412,17 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   RCLCPP_INFO(
     get_logger(), "Opened joystick: %s.  deadzone: %f",
     SDL_JoystickName(joystick_), scaled_deadzone_);
+    std::string name(SDL_JoystickName(joystick_));
+    if (name.find("Xbox") != std::string::npos) {
+      RCLCPP_WARN(get_logger(), "This is modified for Xbox controller axis mapping version.");
+      RCLCPP_WARN(get_logger(), "Swapping axis 2 to 4, 4 to 3, 3 to 1");
+      joy_msg_.header.frame_id = "xbox";
+
+    } else if(name.find("PS5") != std::string::npos){
+      RCLCPP_INFO(get_logger(), "This is PS5 controller, no axis remapping needed.");
+      joy_msg_.header.frame_id = "ps5";
+    }
+
 }
 
 void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
@@ -470,7 +493,7 @@ void Joy::eventThread()
 }
 
     if (joystick_ != nullptr && should_publish) {
-      joy_msg_.header.frame_id = "joy";
+      // joy_msg_.header.frame_id = "joy";
       joy_msg_.header.stamp = this->now();
 
       pub_->publish(joy_msg_);
