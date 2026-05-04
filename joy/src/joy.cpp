@@ -51,6 +51,8 @@ namespace joy
 namespace
 {
 
+auto last_sdl_refresh_time = std::chrono::steady_clock::now();
+
 int remapAxisIndex(const std::string & frame_id, int axis_index)
 {
   if (frame_id == "xbox" || frame_id == "dualsense") {
@@ -144,6 +146,8 @@ Joy::Joy(const rclcpp::NodeOptions & options)
   if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
     throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
   }
+  SDL_JoystickEventState(SDL_ENABLE);
+
   // In theory we could do this with just a timer, which would simplify the code
   // a bit.  But then we couldn't react to "immediate" events, so we stick with
   // the thread.
@@ -357,7 +361,26 @@ bool Joy::handleJoyHatMotion(const SDL_Event & e)
 
 void Joy::handleJoyDeviceAdded(const SDL_Event & e)
 {
-  if (!dev_name_.empty()) {
+  if (joystick_ != nullptr) {
+    if (SDL_JoystickGetAttached(joystick_) == SDL_TRUE) {
+      // Already connected; ignore additional device add notifications.
+      return;
+    }
+
+    // Stale detached handle; clean up and allow reconnect path below.
+    if (haptic_ != nullptr) {
+      SDL_HapticClose(haptic_);
+      haptic_ = nullptr;
+    }
+    SDL_JoystickClose(joystick_);
+    joystick_ = nullptr;
+    joystick_instance_id_ = -1;
+  }
+
+  int selected_dev_id = -1;
+
+  bool selected_by_name = !dev_name_.empty();
+  if (selected_by_name) {
     int num_joysticks = SDL_NumJoysticks();
     if (num_joysticks < 0) {
       RCLCPP_WARN(get_logger(), "Failed to get the number of joysticks: %s", SDL_GetError());
@@ -373,7 +396,7 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
       if (std::string(name) == dev_name_) {
         // We found it!
         matching_device_found = true;
-        dev_id_ = i;
+        selected_dev_id = i;
         break;
       }
     }
@@ -383,21 +406,27 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
         dev_name_.c_str(), SDL_GetError());
       return;
     }
+  } else {
+    // Discovery mode: when no device_name is set, trust the newly discovered device index.
+    selected_dev_id = e.jdevice.which;
   }
 
-  if (e.jdevice.which != dev_id_) {
+  if (selected_dev_id < 0) {
     return;
   }
 
-  joystick_ = SDL_JoystickOpen(dev_id_);
+  joystick_ = SDL_JoystickOpen(selected_dev_id);
   if (joystick_ == nullptr) {
-    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", dev_id_, SDL_GetError());
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "Unable to open joystick %d: %s", selected_dev_id, SDL_GetError());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     return;
   }
 
   // We need to hold onto this so that we can properly remove it on a
   // remove event.
-  joystick_instance_id_ = SDL_JoystickGetDeviceInstanceID(dev_id_);
+  joystick_instance_id_ = SDL_JoystickInstanceID(joystick_);
   if (joystick_instance_id_ < 0) {
     RCLCPP_WARN(get_logger(), "Failed to get instance ID for joystick: %s", SDL_GetError());
     SDL_JoystickClose(joystick_);
@@ -412,7 +441,7 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
     joystick_ = nullptr;
     return;
   }
-  joy_msg_.buttons.resize(num_buttons);
+  joy_msg_.buttons.assign(num_buttons, 0);
 
   int num_axes = SDL_JoystickNumAxes(joystick_);
   if (num_axes < 0) {
@@ -428,7 +457,7 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
     joystick_ = nullptr;
     return;
   }
-  joy_msg_.axes.resize(num_axes + num_hats * 2);
+  joy_msg_.axes.assign(num_axes + num_hats * 2, 0.0f);
 
   const char * joystick_name = SDL_JoystickName(joystick_);
   std::string name = joystick_name == nullptr ? std::string("") : std::string(joystick_name);
@@ -443,6 +472,13 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   } else if (name.find("DualSense") != std::string::npos) {
     RCLCPP_WARN(get_logger(), "This is DualSense controller axis and buttons mapping version.");
     joy_msg_.header.frame_id = "dualsense";
+  }
+
+  // In containerized environments, the first read can lag behind device open.
+  // Force joystick state updates and allow a short settle window before snapshot.
+  for (int i = 0; i < 3; ++i) {
+    SDL_JoystickUpdate();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
   // Get the initial state for each of the axes
@@ -513,7 +549,12 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
 void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
 {
   if (e.jdevice.which != joystick_instance_id_) {
-    return;
+    if (joystick_ == nullptr || SDL_JoystickGetAttached(joystick_) == SDL_TRUE) {
+      return;
+    }
+    RCLCPP_WARN(
+      get_logger(), "Received unmatched remove event instance=%d, but joystick is detached; cleaning up stale state",
+      e.jdevice.which);
   }
 
   joy_msg_.buttons.resize(0);
@@ -526,6 +567,66 @@ void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
     SDL_JoystickClose(joystick_);
     joystick_ = nullptr;
   }
+  joystick_instance_id_ = -1;
+}
+
+void Joy::tryReconnectWithoutEvent()
+{
+  if (joystick_ != nullptr) {
+    return;
+  }
+
+  SDL_JoystickUpdate();
+
+  int num_joysticks = SDL_NumJoysticks();
+  if (num_joysticks < 0) {
+    return;
+  }
+
+  if (num_joysticks == 0) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_sdl_refresh_time >= std::chrono::seconds(2)) {
+      last_sdl_refresh_time = now;
+
+      SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+      SDL_QuitSubSystem(SDL_INIT_JOYSTICK);
+      if (SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
+        RCLCPP_WARN(get_logger(), "SDL_InitSubSystem failed during reconnect refresh: %s", SDL_GetError());
+      } else {
+        SDL_JoystickEventState(SDL_ENABLE);
+      }
+    }
+    return;
+  }
+
+  int candidate_dev_id = dev_id_;
+  if (!dev_name_.empty()) {
+    bool found = false;
+    for (int i = 0; i < num_joysticks; ++i) {
+      const char * name = SDL_JoystickNameForIndex(i);
+      if (name != nullptr && std::string(name) == dev_name_) {
+        candidate_dev_id = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return;
+    }
+  } else if (candidate_dev_id < 0 || candidate_dev_id >= num_joysticks) {
+    candidate_dev_id = 0;
+  }
+
+  // Discovery mode after disconnect: always start from index 0 when no device_name is set.
+  if (dev_name_.empty()) {
+    candidate_dev_id = 0;
+  }
+
+  SDL_Event synthetic_add_event;
+  SDL_zero(synthetic_add_event);
+  synthetic_add_event.type = SDL_JOYDEVICEADDED;
+  synthetic_add_event.jdevice.which = candidate_dev_id;
+  handleJoyDeviceAdded(synthetic_add_event);
 }
 
 void Joy::eventThread()
@@ -559,6 +660,11 @@ void Joy::eventThread()
         RCLCPP_INFO(get_logger(), "Unknown event type %d", e.type);
       }
     }
+
+    if (joystick_ == nullptr) {
+      tryReconnectWithoutEvent();
+    }
+
    if (!should_publish) {
   // So far, nothing has indicated that we should publish.  However we need to
   // do additional checking since there are several possible reasons:
