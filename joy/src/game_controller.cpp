@@ -105,6 +105,10 @@ GameController::GameController(const rclcpp::NodeOptions & options)
 
   future_ = exit_signal_.get_future();
 
+  if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
+    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
+  }
+
   // In theory we could do this with just a timer, which would simplify the code
   // a bit.  But then we couldn't react to "immediate" events, so we stick with
   // the thread.
@@ -113,10 +117,6 @@ GameController::GameController(const rclcpp::NodeOptions & options)
   joy_msg_.buttons.resize(SDL_CONTROLLER_BUTTON_MAX);
 
   joy_msg_.axes.resize(SDL_CONTROLLER_AXIS_MAX);
-
-  if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
-    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
-  }
 }
 
 GameController::~GameController()
@@ -315,6 +315,13 @@ void GameController::handleControllerDeviceAdded(const SDL_ControllerDeviceEvent
     joy_msg_.axes.at(i) = convertRawAxisValueToROS(state);
   }
 
+  // Get the initial state for each of the buttons.
+  for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; ++i) {
+    Uint8 state =
+      SDL_GameControllerGetButton(game_controller_, static_cast<SDL_GameControllerButton>(i));
+    joy_msg_.buttons.at(i) = (state == 0) ? 0 : 1;
+  }
+
 #if SDL_VERSION_ATLEAST(2, 0, 18)
   const char * has_rumble_string = "No";
   if (SDL_GameControllerHasRumble(game_controller_)) {
@@ -327,6 +334,10 @@ void GameController::handleControllerDeviceAdded(const SDL_ControllerDeviceEvent
   RCLCPP_INFO(
     get_logger(), "Opened game controller: %s,  deadzone: %f, rumble: %s",
     SDL_GameControllerName(game_controller_), scaled_deadzone_, has_rumble_string);
+
+  // Request an immediate publish so subscribers get the initialized state.
+  publish_soon_ = true;
+  publish_soon_time_ = this->now();
 }
 
 void GameController::handleControllerDeviceRemoved(const SDL_ControllerDeviceEvent & e)

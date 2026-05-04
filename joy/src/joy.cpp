@@ -48,6 +48,42 @@
 namespace joy
 {
 
+namespace
+{
+
+int remapAxisIndex(const std::string & frame_id, int axis_index)
+{
+  if (frame_id == "xbox" || frame_id == "dualsense") {
+    if (axis_index == 2) {
+      return 4;  // Remap TRIGGERLEFT to PS5 TRIGGERLEFT
+    }
+    if (axis_index == 4) {
+      return 3;  // Remap RIGHT_X to PS5 RIGHT_X
+    }
+    if (axis_index == 3) {
+      return 2;  // Remap RIGHT_Y to PS5 RIGHT_Y
+    }
+  }
+
+  return axis_index;
+}
+
+int remapButtonIndex(const std::string & frame_id, int button_index)
+{
+  if (frame_id == "dualsense") {
+    if (button_index == 2) {
+      return 3;
+    }
+    if (button_index == 3) {
+      return 2;
+    }
+  }
+
+  return button_index;
+}
+
+}
+
 Joy::Joy(const rclcpp::NodeOptions & options)
 : rclcpp::Node("joy_node", options)
 {
@@ -191,15 +227,10 @@ bool Joy::handleJoyAxis(const SDL_Event & e)
     RCLCPP_WARN(get_logger(), "Saw axes too large for this device, ignoring");
     return publish;
   }
-  int axis_index = e.jaxis.axis;
-  if (joy_msg_.header.frame_id == "xbox" || joy_msg_.header.frame_id == "dualsense") {
-    if (axis_index == 2) {
-      axis_index = 4;  // Remap TRIGGERLEFT to PS5 TRIGGERLEFT
-    } else if (axis_index == 4) {
-      axis_index = 3;  // Remap RIGHT_X to PS5 RIGHT_X
-    } else if (axis_index == 3){
-      axis_index =2;   // Remap RIGHT_Y to PS5 RIGHT_Y
-    }
+  int axis_index = remapAxisIndex(joy_msg_.header.frame_id, e.jaxis.axis);
+  if (axis_index >= static_cast<int>(joy_msg_.axes.size())) {
+    RCLCPP_WARN(get_logger(), "Remapped axis index too large for this device, ignoring");
+    return publish;
   }
 
   float last_axis_value = joy_msg_.axes.at(axis_index);
@@ -235,13 +266,10 @@ bool Joy::handleJoyButtonDown(const SDL_Event & e)
     return publish;
   }
 
-  int button_index = e.jbutton.button;
-  if (joy_msg_.header.frame_id == "dualsense") {
-    if (button_index == 2) {
-      button_index = 3;  
-    } else if (button_index == 3){
-      button_index =2;   
-    }
+  int button_index = remapButtonIndex(joy_msg_.header.frame_id, e.jbutton.button);
+  if (button_index >= static_cast<int>(joy_msg_.buttons.size())) {
+    RCLCPP_WARN(get_logger(), "Remapped button index too large for this device, ignoring");
+    return publish;
   }
 
   if (sticky_buttons_) {
@@ -268,13 +296,10 @@ bool Joy::handleJoyButtonUp(const SDL_Event & e)
     return publish;
   }
 
-  int button_index = e.jbutton.button;
-  if (joy_msg_.header.frame_id == "dualsense") {
-    if (button_index == 2) {
-      button_index = 3;  
-    } else if (button_index == 3){
-      button_index =2;   
-    }
+  int button_index = remapButtonIndex(joy_msg_.header.frame_id, e.jbutton.button);
+  if (button_index >= static_cast<int>(joy_msg_.buttons.size())) {
+    RCLCPP_WARN(get_logger(), "Remapped button index too large for this device, ignoring");
+    return publish;
   }
   
   if (!sticky_buttons_) {
@@ -311,6 +336,8 @@ bool Joy::handleJoyHatMotion(const SDL_Event & e)
     return publish;
   }
 
+  joy_msg_.axes.at(axes_start_index) = 0.0;
+  joy_msg_.axes.at(axes_start_index + 1) = 0.0;
   if (e.jhat.value & SDL_HAT_LEFT) {
     joy_msg_.axes.at(axes_start_index) = 1.0;
   }
@@ -322,10 +349,6 @@ bool Joy::handleJoyHatMotion(const SDL_Event & e)
   }
   if (e.jhat.value & SDL_HAT_DOWN) {
     joy_msg_.axes.at(axes_start_index + 1) = -1.0;
-  }
-  if (e.jhat.value == SDL_HAT_CENTERED) {
-    joy_msg_.axes.at(axes_start_index) = 0.0;
-    joy_msg_.axes.at(axes_start_index + 1) = 0.0;
   }
   publish = true;
 
@@ -407,12 +430,63 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   }
   joy_msg_.axes.resize(num_axes + num_hats * 2);
 
+  const char * joystick_name = SDL_JoystickName(joystick_);
+  std::string name = joystick_name == nullptr ? std::string("") : std::string(joystick_name);
+  joy_msg_.header.frame_id = "joy";
+  if (name.find("Xbox") != std::string::npos) {
+    RCLCPP_WARN(get_logger(), "This is modified for Xbox controller axis mapping version.");
+    RCLCPP_WARN(get_logger(), "Swapping axis 2 to 4, 4 to 3, 3 to 1");
+    joy_msg_.header.frame_id = "xbox";
+  } else if (name.find("PS5") != std::string::npos) {
+    RCLCPP_WARN(get_logger(), "This is PS5 controller, no axis remapping needed.");
+    joy_msg_.header.frame_id = "ps5";
+  } else if (name.find("DualSense") != std::string::npos) {
+    RCLCPP_WARN(get_logger(), "This is DualSense controller axis and buttons mapping version.");
+    joy_msg_.header.frame_id = "dualsense";
+  }
+
   // Get the initial state for each of the axes
   for (int i = 0; i < num_axes; ++i) {
-    int16_t state;
-    if (SDL_JoystickGetAxisInitialState(joystick_, i, &state)) {
-      joy_msg_.axes.at(i) = convertRawAxisValueToROS(state);
+    int axis_index = remapAxisIndex(joy_msg_.header.frame_id, i);
+    if (axis_index >= static_cast<int>(joy_msg_.axes.size())) {
+      RCLCPP_WARN(get_logger(), "Remapped initial axis index too large for this device, ignoring");
+      continue;
     }
+
+    int16_t state = SDL_JoystickGetAxis(joystick_, i);
+    joy_msg_.axes.at(axis_index) = convertRawAxisValueToROS(state);
+  }
+
+  // Get the initial state for each hat.
+  for (int i = 0; i < num_hats; ++i) {
+    size_t axes_start_index = num_axes + i * 2;
+    Uint8 hat_state = SDL_JoystickGetHat(joystick_, i);
+    joy_msg_.axes.at(axes_start_index) = 0.0;
+    joy_msg_.axes.at(axes_start_index + 1) = 0.0;
+    if (hat_state & SDL_HAT_LEFT) {
+      joy_msg_.axes.at(axes_start_index) = 1.0;
+    }
+    if (hat_state & SDL_HAT_RIGHT) {
+      joy_msg_.axes.at(axes_start_index) = -1.0;
+    }
+    if (hat_state & SDL_HAT_UP) {
+      joy_msg_.axes.at(axes_start_index + 1) = 1.0;
+    }
+    if (hat_state & SDL_HAT_DOWN) {
+      joy_msg_.axes.at(axes_start_index + 1) = -1.0;
+    }
+  }
+
+  // Get the initial state for each of the buttons.
+  for (int i = 0; i < num_buttons; ++i) {
+    int button_index = remapButtonIndex(joy_msg_.header.frame_id, i);
+    if (button_index >= static_cast<int>(joy_msg_.buttons.size())) {
+      RCLCPP_WARN(get_logger(), "Remapped initial button index too large for this device, ignoring");
+      continue;
+    }
+
+    Uint8 state = SDL_JoystickGetButton(joystick_, i);
+    joy_msg_.buttons.at(button_index) = (state == 0) ? 0 : 1;
   }
 
   haptic_ = SDL_HapticOpenFromJoystick(joystick_);
@@ -429,19 +503,10 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   RCLCPP_INFO(
     get_logger(), "Opened joystick: %s.  deadzone: %f",
     SDL_JoystickName(joystick_), scaled_deadzone_);
-    std::string name(SDL_JoystickName(joystick_));
-    if (name.find("Xbox") != std::string::npos) {
-      RCLCPP_WARN(get_logger(), "This is modified for Xbox controller axis mapping version.");
-      RCLCPP_WARN(get_logger(), "Swapping axis 2 to 4, 4 to 3, 3 to 1");
-      joy_msg_.header.frame_id = "xbox";
 
-    } else if(name.find("PS5") != std::string::npos){
-      RCLCPP_WARN(get_logger(), "This is PS5 controller, no axis remapping needed.");
-      joy_msg_.header.frame_id = "ps5";
-    } else if(name.find("DualSense") != std::string::npos){
-      RCLCPP_WARN(get_logger(), "This is DualSense controller axis and buttons mapping version.");
-      joy_msg_.header.frame_id = "dualsense";
-    } 
+  // Request an immediate publish so subscribers get the initialized state.
+  publish_soon_ = true;
+  publish_soon_time_ = this->now();
 
 }
 
@@ -505,10 +570,12 @@ void Joy::eventThread()
   // If we are autorepeating and enough time has passed, set should_publish.
   rclcpp::Time now = this->now();
   rclcpp::Duration diff_since_last_publish = now - last_publish;
-  if (autorepeat_rate_ > 0.0 && RCL_NS_TO_MS(diff_since_last_publish.nanoseconds()) >= autorepeat_interval_ms_) 
+  if ((autorepeat_rate_ > 0.0 && RCL_NS_TO_MS(diff_since_last_publish.nanoseconds()) >= autorepeat_interval_ms_) ||
+    publish_soon_)
   {
     last_publish = now;
     should_publish = true;
+    publish_soon_ = false;
   }
 }
 
